@@ -1,0 +1,215 @@
+
+# Hardware connections:
+# Up: 21
+# Down: 22
+# Right: 17
+# 4 (unused): 15
+# Solenoid Mosfet: 25
+
+esphome:
+  name: joensuu-palju
+  platform: ESP32
+  board: esp32dev
+
+# Enable logging
+logger:
+
+# No longer need custom source as changes have been merged to esphome
+# external_components:
+#   - source: github://MikkoTervala/esphome@inkbird-add-external
+#     components: [ inkbird_ibsth1_mini ]
+#     refresh: 30s
+
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO19
+
+esp32_ble_tracker:
+
+globals:
+   - id: temperature_setpoint
+     type: float
+     restore_value: yes
+     initial_value: '30'
+
+   - id: hysteresis
+     type: float
+     restore_value: yes
+     initial_value: '1'
+
+sensor:
+  - platform: inkbird_ibsth1_mini
+    mac_address: 10:08:2C:21:C5:3D
+    temperature:
+      id: temperature
+    external_temperature:
+      id: external_temperature
+      on_value:
+        then:
+          - script.execute: reboot_if_no_new_data # Run script to reset timer every time new data arrives
+    humidity:
+      id: humidity
+    battery_level:
+      id: battery_level
+  
+  - platform: uptime
+    id: uptime_seconds
+    update_interval: 5s
+    
+  - platform: ble_rssi
+    mac_address: 10:08:2C:21:C5:3D
+    id: ble_sensor_rssi
+
+binary_sensor:
+  # Up button
+  - platform: gpio
+    pin:
+      number: 21
+      mode: INPUT_PULLUP
+      inverted: True
+    id: button_up
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      - while:
+          condition: # Loop while button is pressed
+            binary_sensor.is_on: button_up
+          then:
+            - if:
+                condition:
+                  display.is_displaying_page: page1
+                then:
+                  - lambda: |- # if less than 45, increment by 0.5
+                      if (id(temperature_setpoint) < 45) {
+                        id(temperature_setpoint) += 0.5;
+                      }
+            - if:
+                condition:
+                  display.is_displaying_page: page2
+                then:
+                  - lambda: |- # If less than 5, increment by 0.25
+                      if (id(hysteresis) < 5) {
+                        id(hysteresis) += 0.25;
+                      }
+            - component.update: my_display
+            - delay: 0.05s
+
+  # Down button
+  - platform: gpio
+    pin:
+      number: 22
+      mode: INPUT_PULLUP
+      inverted: True
+    id: button_down
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      - while:
+          condition: # Loop while button is pressed
+            binary_sensor.is_on: button_down
+          then:
+            - if:
+                condition:
+                  display.is_displaying_page: page1
+                then:
+                  - lambda: |- # If more than 20, decrement by 0.5
+                      if (id(temperature_setpoint) > 20) {
+                        id(temperature_setpoint) -= 0.5;
+                      }
+            - if:
+                condition:
+                  display.is_displaying_page: page2
+                then:
+                  - lambda: |- # If more than 0.25, decrement by 0.25
+                      if (id(hysteresis) > 0.25) {
+                        id(hysteresis) -= 0.25;
+                      }
+            - component.update: my_display
+            - delay: 0.05s
+      
+  # Right button
+  - platform: gpio
+    pin:
+      number: 17
+      mode: INPUT_PULLUP
+      inverted: True
+    id: button_right
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      then: # Show next screen
+        - display.page.show_next: my_display
+        - component.update: my_display
+
+switch:
+  - platform: gpio
+    pin: 25
+    id: solenoid_mosfet
+    restore_mode: ALWAYS_OFF
+    
+  - platform: restart
+    id: restart_node
+
+# While loop to run thermostat function every two seconds
+interval:
+  - interval: 2s
+    then:
+      - if:
+          condition: # If temperature + hysteresis is smaller than setpoint, turn on heating
+            lambda: 'return id(external_temperature).state + id(hysteresis) / 2 < id(temperature_setpoint);'
+          then:
+            switch.turn_on: solenoid_mosfet
+      - if:
+          condition: # If temperature - hysteresis is higher than setpoint, turn off heating
+            lambda: 'return id(external_temperature).state - id(hysteresis) / 2 > id(temperature_setpoint);'
+          then:
+            switch.turn_off: solenoid_mosfet
+
+# Restart device if no new temperature values have been received for five minutes
+# Turns off valve if bluetooth sensor stops working during heating
+script:
+  - id: reboot_if_no_new_data
+    mode: restart
+    then:
+      - delay: 5min
+      - switch.toggle: restart_node
+
+display:
+  - platform: st7789v
+    backlight_pin: GPIO4
+    cs_pin: GPIO5
+    dc_pin: GPIO16
+    reset_pin: GPIO23
+    rotation: 90
+    id: my_display
+    pages:
+      - id: page1
+        lambda: |- # Display current temperature and setpoint
+          it.print(0, 0, id(medium_35), "Palju");
+          it.print(123, 0, id(medium_35), "Tavoite");
+          it.printf(0, 70, id(medium_55), "%.1f", id(external_temperature).state);
+          it.printf(130, 70, id(medium_55), "%.1f", id(temperature_setpoint));
+      - id: page2
+        lambda: |- # Display hysteresis
+          it.print(0, 0, id(medium_35), "Hystereesi");
+          it.printf(0, 70, id(medium_55), "%.1f", id(hysteresis));
+      - id: page3
+        lambda: |- # Display bluetooth RSSI and sensor battery level
+          it.print(0, 0, id(medium_35), "RSSI");
+          it.printf(0, 70, id(medium_55), "%.0f", id(ble_sensor_rssi).state);
+          it.print(125, 0, id(medium_35), "Paristo");
+          it.printf(140, 70, id(medium_55), "%.0f", id(battery_level).state);
+          
+font:
+  - file: "fonts/Roboto-Medium.ttf"
+    id: medium
+    size: 20
+  - file: "fonts/Roboto-Medium.ttf"
+    id: medium_35
+    size: 35
+  - file: "fonts/Roboto-Medium.ttf"
+    id: medium_55
+    size: 55
